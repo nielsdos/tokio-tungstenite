@@ -3,7 +3,6 @@
 //!  There is no dependency on actual TLS implementations. Everything like
 //! `native_tls` or `openssl` will work as long as there is a TLS stream supporting standard
 //! `Read + Write` traits.
-use pin_project::pin_project;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -11,44 +10,58 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Stream, either plain TCP or TLS.
-#[pin_project(project = StreamProj)]
-pub enum Stream<S, T> {
+/// A stream that might be protected with TLS.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum MaybeTlsStream<S> {
     /// Unencrypted socket stream.
-    Plain(#[pin] S),
-    /// Encrypted socket stream.
-    Tls(#[pin] T),
+    Plain(S),
+    /// Encrypted socket stream using `native-tls`.
+    #[cfg(feature = "native-tls")]
+    NativeTls(tokio_native_tls::TlsStream<S>),
+    /// Encrypted socket stream using `rustls`.
+    #[cfg(feature = "__rustls-tls")]
+    Rustls(tokio_rustls::client::TlsStream<S>),
 }
 
-impl<S: AsyncRead + Unpin, T: AsyncRead + Unpin> AsyncRead for Stream<S, T> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            StreamProj::Plain(ref mut s) => Pin::new(s).poll_read(cx, buf),
-            StreamProj::Tls(ref mut s) => Pin::new(s).poll_read(cx, buf),
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::NativeTls(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "__rustls-tls")]
+            MaybeTlsStream::Rustls(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
 
-impl<S: AsyncWrite + Unpin, T: AsyncWrite + Unpin> AsyncWrite for Stream<S, T> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        match self.project() {
-            StreamProj::Plain(ref mut s) => Pin::new(s).poll_write(cx, buf),
-            StreamProj::Tls(ref mut s) => Pin::new(s).poll_write(cx, buf),
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::NativeTls(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "__rustls-tls")]
+            MaybeTlsStream::Rustls(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        match self.project() {
-            StreamProj::Plain(ref mut s) => Pin::new(s).poll_flush(cx),
-            StreamProj::Tls(ref mut s) => Pin::new(s).poll_flush(cx),
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::NativeTls(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "__rustls-tls")]
+            MaybeTlsStream::Rustls(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -56,9 +69,12 @@ impl<S: AsyncWrite + Unpin, T: AsyncWrite + Unpin> AsyncWrite for Stream<S, T> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        match self.project() {
-            StreamProj::Plain(ref mut s) => Pin::new(s).poll_shutdown(cx),
-            StreamProj::Tls(ref mut s) => Pin::new(s).poll_shutdown(cx),
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::NativeTls(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "__rustls-tls")]
+            MaybeTlsStream::Rustls(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

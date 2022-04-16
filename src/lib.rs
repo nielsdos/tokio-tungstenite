@@ -17,14 +17,16 @@ mod compat;
 mod connect;
 mod handshake;
 #[cfg(feature = "stream")]
-pub mod stream;
+mod stream;
+#[cfg(any(feature = "native-tls", feature = "__rustls-tls", feature = "connect"))]
+mod tls;
 
 use std::io::{Read, Write};
 
 use compat::{cvt, AllowStd, ContextWaker};
 use futures_util::{
     sink::{Sink, SinkExt},
-    stream::Stream,
+    stream::{FusedStream, Stream},
 };
 use log::*;
 use std::{
@@ -37,22 +39,27 @@ use tungstenite::{
     client::IntoClientRequest,
     error::Error as WsError,
     handshake::{
-        client::{ClientHandshake, Request, Response},
+        client::{ClientHandshake, Response},
         server::{Callback, NoCallback},
         HandshakeError,
     },
     protocol::{Message, Role, WebSocket, WebSocketConfig},
-    server,
 };
+
+#[cfg(any(feature = "native-tls", feature = "__rustls-tls", feature = "connect"))]
+pub use tls::Connector;
+#[cfg(any(feature = "native-tls", feature = "__rustls-tls"))]
+pub use tls::{client_async_tls, client_async_tls_with_config};
 
 #[cfg(feature = "connect")]
-pub use connect::{
-    client_async_tls, client_async_tls_with_config, connect_async, connect_async_with_config,
-    TlsConnector,
-};
+pub use connect::{connect_async, connect_async_with_config};
 
-#[cfg(all(feature = "connect", feature = "tls"))]
-pub use connect::MaybeTlsStream;
+#[cfg(all(any(feature = "native-tls", feature = "__rustls-tls"), feature = "connect"))]
+pub use connect::connect_async_tls_with_config;
+
+#[cfg(feature = "stream")]
+pub use stream::MaybeTlsStream;
+
 use tungstenite::protocol::CloseFrame;
 
 /// Creates a WebSocket handshake from a request and a stream.
@@ -155,7 +162,7 @@ where
     C: Callback + Unpin,
 {
     let f = handshake::server_handshake(stream, move |allow_std| {
-        server::accept_hdr_with_config(allow_std, callback, config)
+        tungstenite::accept_hdr_with_config(allow_std, callback, config)
     });
     f.await.map_err(|e| match e {
         HandshakeError::Failure(e) => e,
@@ -175,6 +182,8 @@ where
 #[derive(Debug)]
 pub struct WebSocketStream<S> {
     inner: WebSocket<AllowStd<S>>,
+    closing: bool,
+    ended: bool,
 }
 
 impl<S> WebSocketStream<S> {
@@ -208,7 +217,7 @@ impl<S> WebSocketStream<S> {
     }
 
     pub(crate) fn new(ws: WebSocket<AllowStd<S>>) -> Self {
-        WebSocketStream { inner: ws }
+        WebSocketStream { inner: ws, closing: false, ended: false }
     }
 
     fn with_context<F, R>(&mut self, ctx: Option<(ContextWaker, &mut Context<'_>)>, f: F) -> R
@@ -219,7 +228,7 @@ impl<S> WebSocketStream<S> {
     {
         trace!("{}:{} WebSocketStream.with_context", file!(), line!());
         if let Some((kind, ctx)) = ctx {
-            self.inner.get_mut().set_waker(kind, &ctx.waker());
+            self.inner.get_mut().set_waker(kind, ctx.waker());
         }
         f(&mut self.inner)
     }
@@ -229,7 +238,7 @@ impl<S> WebSocketStream<S> {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        &self.inner.get_ref().get_ref()
+        self.inner.get_ref().get_ref()
     }
 
     /// Returns a mutable reference to the inner stream.
@@ -263,14 +272,37 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         trace!("{}:{} Stream.poll_next", file!(), line!());
+
+        // The connection has been closed or a critical error has occurred.
+        // We have already returned the error to the user, the `Stream` is unusable,
+        // so we assume that the stream has been "fused".
+        if self.ended {
+            return Poll::Ready(None);
+        }
+
         match futures_util::ready!(self.with_context(Some((ContextWaker::Read, cx)), |s| {
             trace!("{}:{} Stream.with_context poll_next -> read_message()", file!(), line!());
             cvt(s.read_message())
         })) {
             Ok(v) => Poll::Ready(Some(Ok(v))),
-            Err(WsError::AlreadyClosed) | Err(WsError::ConnectionClosed) => Poll::Ready(None),
-            Err(e) => Poll::Ready(Some(Err(e))),
+            Err(e) => {
+                self.ended = true;
+                if matches!(e, WsError::AlreadyClosed | WsError::ConnectionClosed) {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(e)))
+                }
+            }
         }
+    }
+}
+
+impl<T> FusedStream for WebSocketStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.ended
     }
 }
 
@@ -287,9 +319,7 @@ where
     fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
         match (*self).with_context(None, |s| s.write_message(item)) {
             Ok(()) => Ok(()),
-            Err(::tungstenite::Error::Io(ref err))
-                if err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Err(::tungstenite::Error::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 // the message was accepted and queued
                 // isn't an error.
                 Ok(())
@@ -306,9 +336,21 @@ where
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match (*self).with_context(Some((ContextWaker::Write, cx)), |s| s.close(None)) {
+        let res = if self.closing {
+            // After queueing it, we call `write_pending` to drive the close handshake to completion.
+            (*self).with_context(Some((ContextWaker::Write, cx)), |s| s.write_pending())
+        } else {
+            (*self).with_context(Some((ContextWaker::Write, cx)), |s| s.close(None))
+        };
+
+        match res {
             Ok(()) => Poll::Ready(Ok(())),
             Err(::tungstenite::Error::ConnectionClosed) => Poll::Ready(Ok(())),
+            Err(::tungstenite::Error::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                trace!("WouldBlock");
+                self.closing = true;
+                Poll::Pending
+            }
             Err(err) => {
                 debug!("websocket close error: {}", err);
                 Poll::Ready(Err(err))
@@ -317,17 +359,30 @@ where
     }
 }
 
+/// Get a domain from an URL.
+#[cfg(any(feature = "connect", feature = "native-tls", feature = "__rustls-tls"))]
+#[inline]
+fn domain(request: &tungstenite::handshake::client::Request) -> Result<String, WsError> {
+    match request.uri().host() {
+        Some(d) => Ok(d.to_string()),
+        None => Err(WsError::Url(tungstenite::error::UrlError::NoHostName)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "connect")]
-    use crate::connect::encryption::AutoStream;
+    use crate::stream::MaybeTlsStream;
     use crate::{compat::AllowStd, WebSocketStream};
     use std::io::{Read, Write};
+    #[cfg(feature = "connect")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn is_read<T: Read>() {}
     fn is_write<T: Write>() {}
+    #[cfg(feature = "connect")]
     fn is_async_read<T: AsyncReadExt>() {}
+    #[cfg(feature = "connect")]
     fn is_async_write<T: AsyncWriteExt>() {}
     fn is_unpin<T: Unpin>() {}
 
@@ -337,12 +392,12 @@ mod tests {
         is_write::<AllowStd<tokio::net::TcpStream>>();
 
         #[cfg(feature = "connect")]
-        is_async_read::<AutoStream<tokio::net::TcpStream>>();
+        is_async_read::<MaybeTlsStream<tokio::net::TcpStream>>();
         #[cfg(feature = "connect")]
-        is_async_write::<AutoStream<tokio::net::TcpStream>>();
+        is_async_write::<MaybeTlsStream<tokio::net::TcpStream>>();
 
         is_unpin::<WebSocketStream<tokio::net::TcpStream>>();
         #[cfg(feature = "connect")]
-        is_unpin::<WebSocketStream<AutoStream<tokio::net::TcpStream>>>();
+        is_unpin::<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>();
     }
 }
